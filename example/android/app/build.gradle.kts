@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.tacita.fsd_example"
+    namespace = "com.example.fsd_example"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -20,7 +20,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.tacita.fsd_example"
+        applicationId = "com.example.fsd_example"
         // The plugin pins minSdk to 24; mirror that here so Gradle picks
         // the higher value (avoids "manifest merger" warnings).
         minSdk = 24

@@ -1,7 +1,7 @@
 // fsd: Flutter FFI plugin wrapping stable-diffusion.cpp.
 //
 // Public surface = `FsdEngine`, which implements the `ImageGenEngine`
-// contract Tacita expects. All native calls go through a long-lived helper
+// contract defined below. All native calls go through a long-lived helper
 // isolate so the UI thread never blocks on inference.
 
 library;
@@ -15,7 +15,11 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 // ---------------------------------------------------------------------------
-// Public contract — must match Tacita's lib/imagegen/image_gen_engine.dart
+// Public contract.
+//
+// `ImageGenEngine` is the abstract surface a host application talks to;
+// `FsdEngine` is this plugin's implementation. The split keeps consumer code
+// decoupled from the FFI internals (handy for fakes in widget tests).
 // ---------------------------------------------------------------------------
 
 abstract class ImageGenEngine {
@@ -26,6 +30,20 @@ abstract class ImageGenEngine {
   Future<void> cancel();
 }
 
+/// Sampler family. Mirrors `fsd_sampler_t` in fsd.h.
+///
+/// - [defaultSampler] — LCM sampler + LCM scheduler + cfg=1.0 (the original
+///   fsd defaults). With no [ImageGenRequest.loraPath] this produces
+///   bit-for-bit identical output to legacy single-arg `fsd_generate` callers
+///   for the same seed.
+/// - [lcm] — same as default today. Layered with [ImageGenRequest.loraPath]
+///   pointing at an LCM LoRA, this is the "4 step" regime: callers should pass
+///   [ImageGenRequest.steps] = 4 and let [cfgScale] default to 1.0.
+enum FsdSampler {
+  defaultSampler,
+  lcm,
+}
+
 class ImageGenRequest {
   const ImageGenRequest({
     required this.prompt,
@@ -34,13 +52,39 @@ class ImageGenRequest {
     this.height = 512,
     this.steps = 4,
     this.seed,
+    this.sampler = FsdSampler.defaultSampler,
+    this.cfgScale,
+    this.loraPath,
+    this.loraScale,
   });
+
   final String prompt;
   final String negativePrompt;
   final int width;
   final int height;
+
+  /// Sampling steps. LCM-distilled SD 1.5 converges in 4 steps; vanilla SD
+  /// 1.5 wants 20+. When [sampler] is [FsdSampler.lcm] and the caller doesn't
+  /// override, 4 is a sane default.
   final int steps;
   final int? seed;
+  final FsdSampler sampler;
+
+  /// Classifier-free-guidance scale. Null (the default) means "let fsd pick"
+  /// — fsd uses 1.0, the LCM-canonical value. Non-LCM workflows typically
+  /// want 7.0 here.
+  final double? cfgScale;
+
+  /// Optional LoRA file path. .safetensors or .gguf both work — see
+  /// stable-diffusion.cpp's ModelLoader. When set, the LoRA is applied for
+  /// this single generate() call. The most common use is an LCM LoRA paired
+  /// with `sampler = FsdSampler.lcm`, `steps = 4`, `cfgScale = 1.0`.
+  final String? loraPath;
+
+  /// LoRA strength multiplier. Null -> 1.0 (full strength). Range is
+  /// effectively 0..1 for LCM LoRAs; higher values amplify both the speed
+  /// boost and the "plasticky" look LCM is known for.
+  final double? loraScale;
 }
 
 sealed class ImageGenProgress {}
@@ -97,29 +141,43 @@ typedef _FsdFreeBytesDart = void Function(Pointer<Uint8>);
 typedef _FsdSdCommitNative = Pointer<Utf8> Function();
 typedef _FsdSdCommitDart = Pointer<Utf8> Function();
 
+typedef _FsdGpuAvailableNative = Int32 Function();
+typedef _FsdGpuAvailableDart = int Function();
+
 typedef _StepCbNative = Int32 Function(Int32 step, Int32 total, Pointer<Void> user);
 
-typedef _FsdGenerateNative = Int32 Function(
+// Mirrors fsd_gen_params_t in fsd.h. Field order MUST match the C layout.
+final class _FsdGenParams extends Struct {
+  external Pointer<Utf8> prompt;
+  external Pointer<Utf8> negativePrompt;
+  @Int32()
+  external int width;
+  @Int32()
+  external int height;
+  @Int32()
+  external int steps;
+  @Int64()
+  external int seed;
+  @Int32()
+  external int sampler; // fsd_sampler_t enum
+  @Float()
+  external double cfgScale;
+  external Pointer<Utf8> loraPath;
+  @Float()
+  external double loraScale;
+}
+
+typedef _FsdGenerateV2Native = Int32 Function(
   Pointer<Void>,
-  Pointer<Utf8>,
-  Pointer<Utf8>,
-  Int32,
-  Int32,
-  Int32,
-  Int64,
+  Pointer<_FsdGenParams>,
   Pointer<NativeFunction<_StepCbNative>>,
   Pointer<Void>,
   Pointer<Pointer<Uint8>>,
   Pointer<IntPtr>,
 );
-typedef _FsdGenerateDart = int Function(
+typedef _FsdGenerateV2Dart = int Function(
   Pointer<Void>,
-  Pointer<Utf8>,
-  Pointer<Utf8>,
-  int,
-  int,
-  int,
-  int,
+  Pointer<_FsdGenParams>,
   Pointer<NativeFunction<_StepCbNative>>,
   Pointer<Void>,
   Pointer<Pointer<Uint8>>,
@@ -135,10 +193,14 @@ final _FsdRequestCancelDart _fsdRequestCancel = _dylib
         'fsd_request_cancel');
 final _FsdFreeBytesDart _fsdFreeBytes = _dylib
     .lookupFunction<_FsdFreeBytesNative, _FsdFreeBytesDart>('fsd_free_bytes');
-final _FsdGenerateDart _fsdGenerate =
-    _dylib.lookupFunction<_FsdGenerateNative, _FsdGenerateDart>('fsd_generate');
+final _FsdGenerateV2Dart _fsdGenerateV2 = _dylib
+    .lookupFunction<_FsdGenerateV2Native, _FsdGenerateV2Dart>(
+        'fsd_generate_v2');
 final _FsdSdCommitDart _fsdSdCommit =
     _dylib.lookupFunction<_FsdSdCommitNative, _FsdSdCommitDart>('fsd_sd_commit');
+final _FsdGpuAvailableDart _fsdGpuAvailable = _dylib
+    .lookupFunction<_FsdGpuAvailableNative, _FsdGpuAvailableDart>(
+        'fsd_gpu_available');
 
 /// The pinned upstream stable-diffusion.cpp commit hash, as reported by the
 /// native library. Useful when filing bug reports.
@@ -147,6 +209,12 @@ String get nativeStableDiffusionCommit {
   if (p == nullptr) return 'unknown';
   return p.toDartString();
 }
+
+/// True if libfsd was compiled with Vulkan compute support AND a Vulkan-capable
+/// device is available at runtime. False on CPU-only builds and on devices
+/// without a Vulkan ICD. The CPU path remains the default regardless — this
+/// is a UI hint, not a switch.
+bool get gpuAvailable => _fsdGpuAvailable() != 0;
 
 // ---------------------------------------------------------------------------
 // Helper-isolate protocol
@@ -359,6 +427,10 @@ void _runGenerate(Pointer<Void> ctx, _GenerateRequest msg) {
 
   final promptPtr = msg.req.prompt.toNativeUtf8();
   final negPtr = msg.req.negativePrompt.toNativeUtf8();
+  final loraPtr = (msg.req.loraPath != null && msg.req.loraPath!.isNotEmpty)
+      ? msg.req.loraPath!.toNativeUtf8()
+      : nullptr;
+  final paramsPtr = calloc<_FsdGenParams>();
   final pngOutPtr = calloc<Pointer<Uint8>>();
   final pngLenPtr = calloc<IntPtr>();
 
@@ -375,15 +447,24 @@ void _runGenerate(Pointer<Void> ctx, _GenerateRequest msg) {
   );
 
   try {
-    final seed = msg.req.seed ?? -1;
-    final rc = _fsdGenerate(
+    final p = paramsPtr.ref;
+    p.prompt          = promptPtr;
+    p.negativePrompt  = negPtr;
+    p.width           = msg.req.width;
+    p.height          = msg.req.height;
+    p.steps           = msg.req.steps;
+    p.seed            = msg.req.seed ?? -1;
+    p.sampler         = switch (msg.req.sampler) {
+      FsdSampler.defaultSampler => 0,
+      FsdSampler.lcm            => 1,
+    };
+    p.cfgScale        = msg.req.cfgScale ?? 0.0; // 0 -> native default (1.0)
+    p.loraPath        = loraPtr.cast<Utf8>();
+    p.loraScale       = msg.req.loraScale ?? 0.0; // 0 -> native default (1.0)
+
+    final rc = _fsdGenerateV2(
       ctx,
-      promptPtr,
-      negPtr,
-      msg.req.width,
-      msg.req.height,
-      msg.req.steps,
-      seed,
+      paramsPtr,
       stepCallable.nativeFunction,
       nullptr,
       pngOutPtr,
@@ -413,6 +494,8 @@ void _runGenerate(Pointer<Void> ctx, _GenerateRequest msg) {
     stepCallable.close();
     calloc.free(promptPtr);
     calloc.free(negPtr);
+    if (loraPtr != nullptr) calloc.free(loraPtr);
+    calloc.free(paramsPtr);
     calloc.free(pngOutPtr);
     calloc.free(pngLenPtr);
   }

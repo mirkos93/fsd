@@ -5,10 +5,10 @@
 # (Homebrew: `brew install cmake`). It is the iOS counterpart of the Android
 # Gradle/CMake invocation in `android/build.gradle`.
 #
-# Status: DRAFT for F2.4. Designed but not yet executed (the F2.1 author
-# wrote it from a WSL machine without a Mac in reach). Expect to find at
-# least one Apple-toolchain quirk on first run; treat as a starting point,
-# not a finished build.
+# Status: DRAFT. Designed but not yet executed (the original author wrote
+# it from a WSL machine without a Mac in reach). Expect to find at least
+# one Apple-toolchain quirk on first run; treat as a starting point, not
+# a finished build.
 #
 # Output layout:
 #   ios/Frameworks/fsd.xcframework/
@@ -50,8 +50,8 @@ mkdir -p "${BUILD}" "$(dirname "${OUT}")"
 
 # Each slice configures and builds independently. We want STATIC libfsd.a
 # (and a libtool merge of all transitive static deps from sd.cpp + ggml) so
-# the xcframework is self-contained — Tacita's Runner.app links it directly
-# and Dart resolves symbols via `DynamicLibrary.process()`.
+# the xcframework is self-contained — the consumer's Runner.app links it
+# directly and Dart resolves symbols via `DynamicLibrary.process()`.
 build_slice() {
     local sdk="$1"        # iphoneos | iphonesimulator
     local archs="$2"      # "arm64" or "arm64;x86_64"

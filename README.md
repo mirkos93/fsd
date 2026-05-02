@@ -1,33 +1,117 @@
 # fsd
 
 Flutter FFI plugin that wraps [`leejet/stable-diffusion.cpp`][sdcpp] for
-on-device image generation. Built for [Tacita][tacita], a privacy-first
-LLM chat app, but the public surface is a generic `ImageGenEngine` so
-nothing here is Tacita-specific.
+on-device image generation. The public surface is a generic
+`ImageGenEngine` contract plus an `FsdEngine` implementation; everything
+else is plumbing.
 
 [sdcpp]: https://github.com/leejet/stable-diffusion.cpp
-[tacita]: https://github.com/Tacita-app
+
+## What it is
+
+- A Dart Flutter plugin built around `dart:ffi`. No platform channels.
+- Native code is `stable-diffusion.cpp` + `ggml`, compiled into a single
+  `libfsd.so` (Android) / `fsd.xcframework` (iOS) via CMake.
+- Inference runs on a dedicated helper isolate, so the UI thread never
+  blocks on denoising.
+- Progress callbacks stream out of the denoising loop via
+  `NativeCallable.isolateLocal`.
 
 ## Status
 
-| Capability | F2.1 |
+| Capability | State |
 |---|---|
-| Android arm64-v8a (CPU) | ✅ shipped |
-| Android armeabi-v7a | ❌ not viable (see *Why no v7a* below) |
-| Android x86_64 | ❌ skipped |
-| iOS (Metal) | ⏳ build pipeline drafted (see *iOS build* below), untested — needs a Mac |
-| Vulkan / GPU backends | ⏳ F2.3 |
+| Android arm64-v8a (CPU) | shipped |
+| Android Vulkan offload | opt-in via `fsdVulkan=true` Gradle property |
+| Android armeabi-v7a | not viable (see *Why no v7a* below) |
+| Android x86_64 | not built |
+| iOS (Metal) | build pipeline drafted, untested without a Mac |
+| SDXL | not supported |
+| img2img / inpainting | not exposed |
 
 ## Pinned upstream
 
 `third_party/stable-diffusion.cpp` is a git submodule pinned to commit
 **`3d6064b37ef4607917f8acf2ca8c8906d5087413`** (`perf: speed up
-tensor_to_sd_image conversion`, #1466). Anyone cloning this repo gets
-exactly that source. The same hash is exposed at runtime via
+tensor_to_sd_image conversion`, upstream PR #1466). Anyone cloning this
+repo gets exactly that source. The same hash is exposed at runtime via
 `nativeStableDiffusionCommit` (delegates to upstream `sd_commit()`).
 
 If you bump the submodule, also update the hash in this README and
 verify the example app still builds and produces valid PNGs.
+
+## Quick start
+
+Add the plugin as a git dependency in `pubspec.yaml` (no pub.dev release
+yet):
+
+```yaml
+dependencies:
+  fsd:
+    git:
+      url: https://github.com/mirkos93/fsd.git
+      ref: <pinned-commit-sha>
+```
+
+Then run `flutter pub get`. `--recurse-submodules` is handled
+automatically by the build because the submodule is fetched on first
+CMake configure step (Gradle on Android, the build script on iOS).
+
+Minimal usage:
+
+```dart
+import 'package:fsd/fsd.dart';
+
+final engine = FsdEngine();
+await engine.loadModel(modelPath: '/absolute/path/to/sd_v1.5.gguf');
+
+final stream = engine.generate(
+  request: const ImageGenRequest(
+    prompt: 'a watercolour painting of a fox in a forest, soft light',
+    width: 256,
+    height: 256,
+    steps: 4,
+    sampler: FsdSampler.lcm,
+    // For an LCM 4-step regime point loraPath at an LCM-distilled LoRA:
+    // loraPath: '/path/to/lcm_lora_sd1.5.safetensors',
+  ),
+);
+
+await for (final event in stream) {
+  switch (event) {
+    case ImageGenStep(:final step, :final total):
+      // progress UI: step / total
+    case ImageGenDone(:final pngBytes):
+      // pngBytes is a Uint8List, ready to feed Image.memory(...)
+    case ImageGenError(:final message):
+      // surface the error
+  }
+}
+
+await engine.unloadModel();
+await engine.dispose();
+```
+
+Cancel a running generation with `engine.cancel()`. See *Cancel
+semantics* below for the (between-step) caveat.
+
+## Supported model formats
+
+- **SD 1.5** weights as either `.gguf` (preferred for size) or
+  `.safetensors`.
+- **LoRA**: `.safetensors` and `.gguf` both work — see
+  `stable-diffusion.cpp`'s `ModelLoader`. The LoRA is applied for the
+  duration of one `generate()` call. The expected use is an LCM LoRA
+  paired with `FsdSampler.lcm`, `steps = 4`, `cfgScale = 1.0`.
+- **CLIP / VAE** weights baked into the same checkpoint as
+  `stable-diffusion.cpp` expects them (i.e. a "full" SD 1.5 GGUF). No
+  separate CLIP / VAE file paths are exposed.
+- **Quantizations**: `Q4_0` and `Q8_0` are the realistic options on
+  phones. `F16` works but is wasteful on RAM.
+
+SDXL, SD 2.x, and Flux variants are not exposed by this plugin even
+though `stable-diffusion.cpp` itself can load them — the build hasn't
+been validated against them and the public API names assume SD 1.5.
 
 ## Build (Android)
 
@@ -37,25 +121,44 @@ Requirements:
 - Android NDK r26+ (this repo was tested with `27.0.12077973`, which
   AGP autoinstalls if it's missing).
 - CMake 3.22+ (NOT 3.10 like the Flutter scaffold default — `ggml`
-  needs ≥ 3.14 internally and `stable-diffusion.cpp` declares 3.12).
+  needs >= 3.14 internally and `stable-diffusion.cpp` declares 3.12).
   AGP normally bundles its own; if your environment has only a broken
   system `cmake`, set `cmake.dir=/usr` (or wherever a working CMake
   install lives) in `example/android/local.properties`.
 
-Reproduce the build from a clean clone:
+Reproduce the example app build from a clean clone:
 
 ```bash
-git clone --recurse-submodules <this-repo> fsd
+git clone --recurse-submodules https://github.com/mirkos93/fsd.git
 cd fsd
 flutter pub get
 cd example
 flutter pub get
 flutter build apk --target-platform=android-arm64 --release
-# → example/build/app/outputs/flutter-apk/app-release.apk (~40 MB)
+# -> example/build/app/outputs/flutter-apk/app-release.apk (~40 MB)
 ```
 
-The `libfsd.so` payload is ~22 MB stripped (sd.cpp + ggml + our shim
-all statically linked, single ABI).
+The `libfsd.so` payload is ~22 MB stripped (sd.cpp + ggml + the C++
+shim all statically linked, single ABI).
+
+### Vulkan offload (opt-in)
+
+To compile the `ggml-vulkan` backend into `libfsd.so`, pass
+`-PfsdVulkan=true` (or set `fsdVulkan=true` in
+`android/gradle.properties`). This:
+
+- adds `-DSD_VULKAN=ON` to the CMake invocation,
+- bumps the NDK platform to `android-28` (Vulkan 1.1 entry points
+  needed by ggml-vulkan are not exported by the NDK's `libvulkan.so`
+  on older platforms),
+- requires `glslc` (Vulkan SDK) on the host PATH so the cross-compile
+  of `vulkan-shaders-gen` can run.
+
+The CPU code path remains the default. At runtime,
+`gpuAvailable` (delegating to `fsd_gpu_available()`) reports whether
+both the build had Vulkan ON and a Vulkan-capable physical device is
+visible. Treat it as a UI hint rather than a switch — the engine falls
+back to CPU on its own.
 
 ### Smoke-testing the example app
 
@@ -64,14 +167,14 @@ The default points at the app-scoped external dir, which needs no
 runtime permission:
 
 ```bash
-# 1) Get an LCM-distilled SD 1.5 checkpoint. Recommended:
-#    https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5
-#    + an LCM LoRA distilled into a single GGUF (any q4_0 / q8_0 build).
-#    The repo does NOT ship the model — too large, IP-encumbered.
+# 1) Get an SD 1.5 checkpoint (e.g. from
+#    https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5)
+#    + optionally an LCM LoRA distilled into a single GGUF (any
+#    Q4_0 / Q8_0 build). The repo does NOT ship the model.
 
 # 2) Push to the device after the example is installed once:
-adb push sd_v1.5_lcm.gguf \
-    /sdcard/Android/data/com.tacita.fsd_example/files/
+adb push sd_v1.5.gguf \
+    /sdcard/Android/data/com.example.fsd_example/files/
 
 # 3) Open the app, tap Load, then Generate.
 ```
@@ -83,11 +186,11 @@ step that produces a vendored xcframework, and a normal `pod install`
 that consumes it. This keeps the per-app `pod install` fast and lets
 `pod lib lint` succeed with no exotic CMake-on-CocoaPods plumbing.
 
-**Step 1 (Mac, Xcode 15+, CMake ≥ 3.22 from Homebrew):**
+**Step 1 (Mac, Xcode 15+, CMake >= 3.22 from Homebrew):**
 
 ```bash
 ./tool/build_ios_xcframework.sh
-# → ios/Frameworks/fsd.xcframework  (gitignored)
+# -> ios/Frameworks/fsd.xcframework  (gitignored)
 ```
 
 The script:
@@ -110,22 +213,19 @@ linking a hollow pod.
 - Apple's `pod install` invokes Xcode, not CMake. Trying to drive
   sd.cpp+ggml's CMake from inside a `prepare_command` works but
   makes pod install take ~5 min and re-runs on every clean checkout.
-- A vendored xcframework is what fllama-style production plugins
-  ship with. CI can produce it once per release; consumers never
-  rebuild it.
+- A vendored xcframework is what production native plugins ship with.
+  CI can produce it once per release; consumers never rebuild it.
 
-### Can I do step 1 on CircleCI without owning a Mac?
+### Building the xcframework on CI without owning a Mac
 
-Yes. CircleCI's macOS executor runs Xcode and Homebrew, so
-`./tool/build_ios_xcframework.sh` runs unmodified. Wire it into a job
-that uploads `ios/Frameworks/fsd.xcframework` as a workflow artifact
-(or attaches it to a GitHub release); Tacita's normal `pod install`
-then downloads it. **Status:** the script is drafted but has never
-been executed — first attempt on a Mac will likely surface 1–2
-toolchain quirks to fix (Metal shader path, libtool merge order,
-maybe `-fembed-bitcode` settings depending on the Xcode version).
-Treat F2.4 as "wire CircleCI + iterate on this script", not "ship
-done".
+CircleCI, GitHub Actions, and Bitrise all expose macOS executors with
+Xcode and Homebrew preinstalled. `./tool/build_ios_xcframework.sh`
+runs unmodified there. Wire it into a job that uploads
+`ios/Frameworks/fsd.xcframework` as a workflow artifact (or attaches
+it to a GitHub release). The script is drafted but has not been
+executed yet — first attempt will likely surface 1–2 toolchain quirks
+to fix (Metal shader path, libtool merge order, possibly
+`-fembed-bitcode` settings depending on the Xcode version).
 
 ## Why no armeabi-v7a (32-bit ARM)
 
@@ -146,25 +246,25 @@ that ABI, and brace for unusable inference latency.
 
 ## Architecture
 
-- `src/fsd.h` / `src/fsd.cpp` — the C++ shim. Six `extern "C"`
-  symbols (`fsd_load`, `fsd_free`, `fsd_generate`, `fsd_free_bytes`,
-  `fsd_request_cancel`, `fsd_sd_commit`). Includes upstream's
-  `stb_image_write.h` to encode the RGB output to PNG in the same
-  process.
+- `src/fsd.h` / `src/fsd.cpp` — the C++ shim. Seven `extern "C"`
+  symbols (`fsd_load`, `fsd_free`, `fsd_generate`, `fsd_generate_v2`,
+  `fsd_free_bytes`, `fsd_request_cancel`, `fsd_sd_commit`,
+  `fsd_gpu_available`). Includes upstream's `stb_image_write.h` to
+  encode the RGB output to PNG in the same process.
 - `src/CMakeLists.txt` — disables every sd.cpp backend except CPU
-  for F2.1, builds with `-O3 -ffast-math -fno-finite-math-only` and
-  `-fvisibility=hidden`, statically links `stable-diffusion`.
+  (and Vulkan, if `SD_VULKAN=ON`), builds with
+  `-O3 -ffast-math -fno-finite-math-only` and `-fvisibility=hidden`,
+  statically links `stable-diffusion`.
 - `android/build.gradle` — pins `cmake.version = "3.22.1"`,
   `minSdk = 24`, `abiFilters = ["arm64-v8a"]`. No Kotlin/Java
   scaffolding — the plugin is pure FFI.
-- `lib/fsd.dart` — `FsdEngine` implements Tacita's `ImageGenEngine`
-  contract. All native work runs on a dedicated helper isolate spawned
-  on first use, so the UI thread never blocks. Progress streams back
-  via a `ReceivePort` fed by `NativeCallable.isolateLocal` from inside
-  the denoising loop.
+- `lib/fsd.dart` — `FsdEngine` implements `ImageGenEngine`. All native
+  work runs on a dedicated helper isolate spawned on first use, so the
+  UI thread never blocks. Progress streams back via a `ReceivePort`
+  fed by `NativeCallable.isolateLocal` from inside the denoising loop.
 - `example/lib/main.dart` — minimal smoke-test UI: model path field,
-  Load/Unload, prompt + Generate (256×256, 4 LCM steps), live progress
-  + final PNG preview.
+  Load/Unload, prompt + Generate (256x256, 4 LCM steps), live
+  progress + final PNG preview.
 
 ### Cancel semantics
 
@@ -174,41 +274,54 @@ proxy after each denoising step. Caveat: upstream's progress callback
 returns `void`, so an in-flight step cannot be interrupted; the
 current step finishes, then `fsd_generate` returns `-3` (cancelled)
 and the Dart Stream emits `ImageGenError("cancelled")`. With LCM at
-4 steps and 256×256, "between steps" is a few hundred ms on a recent
+4 steps and 256x256, "between steps" is a few hundred ms on a recent
 phone — usually fine. If you need true mid-step abort, you'd have to
 wire `ggml_backend_cpu_set_abort_callback` into the upstream code.
 
-## Measured latency (initial, very rough)
+## Performance notes
 
-These numbers come from `flutter run --release` against the **Pixel
-emulator (x86_64 host CPU)** and are useful only as a lower bound for
-"the build runs end-to-end". Real device numbers go here once tested:
+These are very rough lower-bound numbers from `flutter run --release`
+against the **Pixel emulator (x86_64 host CPU)**. Real-device numbers
+should replace them once collected:
 
-| Setup | Model | Resolution × Steps | First-token time | Per-step | Total |
-|---|---|---|---|---|---|
-| Pixel 6 (Tensor G1, real device) | _todo_ | 256×256 × 4 | _todo_ | _todo_ | _todo_ |
-| Galaxy S22 (SD 8 Gen 1) | _todo_ | 256×256 × 4 | _todo_ | _todo_ | _todo_ |
-| Pixel 4a emulator AVD | _todo_ | 256×256 × 4 | _todo_ | _todo_ | _todo_ |
+| Setup | Resolution × Steps | Per-step | Total |
+|---|---|---|---|
+| Pixel 8 Pro (Tensor G3, real device) | 256x256 × 4 LCM | _todo_ | _todo_ |
+| Pixel 6 (Tensor G1, real device) | 256x256 × 4 LCM | _todo_ | _todo_ |
+| Pixel 4a emulator AVD | 256x256 × 4 LCM | _todo_ | _todo_ |
 
-To collect: run the example, generate three times in a row (the first
-load amortises model mmap), copy the `[fsd]` lines from `flutter logs`,
-and paste them above.
+LCM-distilled 4-step is roughly 5x faster end-to-end than vanilla SD
+1.5 at 20+ steps for similar perceptual quality, at the cost of the
+"plasticky" LCM look on hard prompts. Pair `FsdSampler.lcm` with an
+LCM LoRA via `loraPath` for that path.
+
+To collect numbers: run the example, generate three times in a row
+(the first load amortises model mmap), copy the `[fsd]` lines from
+`flutter logs`, and paste them above.
 
 ## Verifying the build
 
 - `flutter analyze` — clean.
-- Generated `.so` exports exactly the 6 documented symbols (verify
+- Generated `.so` exports the documented `fsd_*` symbols (verify
   with `nm -D --defined-only $(find example/build -name libfsd.so) |
   grep fsd_`).
 - APK size for the example: ~40 MB release, dominated by the 22 MB
   `libfsd.so`.
 
-## Roadmap
+## Limitations
 
-- F2.2 — wire `FsdEngine` into Tacita as the production `ImageGenEngine`
-  provider, behind a feature flag.
-- F2.3 — Vulkan backend (`-DSD_VULKAN=ON`), gated on Adreno 6xx+ /
-  Mali-G68+ to avoid driver lottery on older GPUs.
-- F2.4 — iOS build (Metal backend). Pipeline drafted in
-  `tool/build_ios_xcframework.sh` + `ios/fsd.podspec`; needs first
-  successful run on a Mac (or CircleCI macOS executor).
+- Android arm64-v8a only. No x86_64 emulator support (excluded from
+  `abiFilters`); use a real arm64 device or an arm64 emulator host.
+- No SDXL / SD 2.x / Flux. The wrapper assumes SD 1.5.
+- No img2img and no inpainting paths exposed today; the public API
+  is text2img only.
+- The progress hook is between-step (see *Cancel semantics*).
+- iOS pipeline is unbuilt — first run on real Apple hardware will
+  almost certainly surface toolchain quirks.
+
+## License
+
+MIT, matching upstream `stable-diffusion.cpp`. See
+[`LICENSE`](LICENSE) for the plugin code, and
+[`third_party/stable-diffusion.cpp/LICENSE`](third_party/stable-diffusion.cpp/LICENSE)
+for the upstream library.

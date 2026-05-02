@@ -32,9 +32,9 @@ Pod::Spec.new do |s|
     is shipped as a prebuilt xcframework; see tool/build_ios_xcframework.sh
     in the plugin repo for how to (re)produce it.
   DESC
-  s.homepage         = 'https://github.com/Tacita-app/fsd'
+  s.homepage         = 'https://github.com/mirkos93/fsd'
   s.license          = { :file => '../LICENSE' }
-  s.author           = { 'Tacita' => 'mirkos93@gmail.com' }
+  s.author           = { 'Mirko Soldano' => 'mirkos93@gmail.com' }
 
   s.source           = { :path => '.' }
   s.vendored_frameworks = 'Frameworks/fsd.xcframework'

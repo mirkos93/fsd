@@ -20,6 +20,44 @@ typedef struct fsd_ctx fsd_ctx;
 // cancellation (best-effort: see fsd_request_cancel notes below).
 typedef int (*fsd_step_cb)(int step, int total, void* user);
 
+// Sampler family selector. Mirrors a coarse "what speed/quality regime do you
+// want?" knob rather than the full sample_method_t enum from upstream — the
+// fine-grained choice (Euler vs. Heun vs. DPM++) is the engine's job; the
+// caller only decides between the two regimes this plugin exposes.
+//
+//   FSD_SAMPLER_DEFAULT — LCM sampler + LCM scheduler + cfg=1.0. Matches the
+//                         original fsd_generate behaviour and is bit-for-bit
+//                         identical to that signature when the same
+//                         seed/steps/W/H are supplied.
+//   FSD_SAMPLER_LCM     — Same as DEFAULT today (kept distinct so future
+//                         non-LCM defaults don't break LCM callers). Layered
+//                         on top: when an LCM LoRA is supplied via lora_path
+//                         the caller is expected to pass steps=4 and
+//                         cfg_scale=1.0; we don't override.
+typedef enum {
+    FSD_SAMPLER_DEFAULT = 0,
+    FSD_SAMPLER_LCM     = 1,
+} fsd_sampler_t;
+
+// Generation request. Zero-initialised fields fall back to fsd defaults:
+//   - lora_path == NULL          -> no LoRA applied
+//   - lora_scale == 0            -> treated as 1.0 (only when lora_path set)
+//   - sampler == FSD_SAMPLER_DEFAULT
+//   - cfg_scale == 0             -> treated as 1.0 (LCM canonical)
+//   - steps  == 0                -> treated as 4 (LCM canonical for SD 1.5)
+typedef struct {
+    const char*   prompt;
+    const char*   negative_prompt;
+    int           width;
+    int           height;
+    int           steps;
+    int64_t       seed;
+    fsd_sampler_t sampler;
+    float         cfg_scale;
+    const char*   lora_path;     // optional, may be NULL
+    float         lora_scale;    // 0 -> 1.0 default
+} fsd_gen_params_t;
+
 // Loads a stable-diffusion checkpoint. Returns NULL on failure.
 FSD_API fsd_ctx* fsd_load(const char* model_path);
 
@@ -32,6 +70,10 @@ FSD_API void fsd_free(fsd_ctx* ctx);
 //
 // LCM-friendly defaults baked in: LCM sampler, cfg_scale=1.0, no negative
 // prompt weighting beyond what the caller passes, RNG = std default.
+//
+// NOTE: this is the legacy v1 entrypoint kept for backwards compatibility
+// with consumers that don't need LoRA / sampler control. New code should call
+// fsd_generate_v2.
 FSD_API int fsd_generate(
     fsd_ctx* ctx,
     const char* prompt,
@@ -40,6 +82,19 @@ FSD_API int fsd_generate(
     int height,
     int steps,
     int64_t seed,
+    fsd_step_cb cb,
+    void* cb_user,
+    uint8_t** png_out,
+    size_t* png_len_out);
+
+// Same contract as fsd_generate but routed through fsd_gen_params_t. With
+// params->lora_path == NULL and params->sampler == FSD_SAMPLER_DEFAULT, this
+// is bit-for-bit equivalent to fsd_generate (same RNG, same sampler, same
+// cfg). LoRA — when supplied — is loaded for the duration of this single
+// generate() call and unloaded by free_sd_ctx-internal lifecycle.
+FSD_API int fsd_generate_v2(
+    fsd_ctx* ctx,
+    const fsd_gen_params_t* params,
     fsd_step_cb cb,
     void* cb_user,
     uint8_t** png_out,
@@ -58,6 +113,17 @@ FSD_API void fsd_request_cancel(fsd_ctx* ctx);
 // Returns the pinned upstream stable-diffusion.cpp commit (delegates to
 // sd_commit()). Useful for debugging.
 FSD_API const char* fsd_sd_commit(void);
+
+// Returns 1 if this libfsd was compiled with Vulkan compute support
+// (-DSD_VULKAN=ON) AND the runtime device exposes at least one Vulkan-capable
+// physical device, 0 otherwise. The runtime probe is a best-effort
+// dlopen("libvulkan.so") + vkEnumeratePhysicalDevices: we never link
+// libvulkan into libfsd.so directly, so a phone without a Vulkan ICD won't
+// fail to load the library — we just fall back to CPU silently.
+//
+// On builds where SD_VULKAN was OFF this always returns 0. The CPU code path
+// is unaffected and remains the default.
+FSD_API int fsd_gpu_available(void);
 
 #ifdef __cplusplus
 }

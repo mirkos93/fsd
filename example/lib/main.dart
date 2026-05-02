@@ -38,10 +38,10 @@ class _HomeState extends State<_Home> {
   final _engine = FsdEngine();
   // Default to the app-scoped external dir — no storage permission needed,
   // and reachable from adb without su:
-  //   adb push model.gguf /sdcard/Android/data/com.tacita.fsd_example/files/
+  //   adb push model.gguf /sdcard/Android/data/com.example.fsd_example/files/
   final _modelCtrl = TextEditingController(
     text: Platform.isAndroid
-        ? '/sdcard/Android/data/com.tacita.fsd_example/files/sd_v1.5_lcm.gguf'
+        ? '/sdcard/Android/data/com.example.fsd_example/files/sd_v1.5_lcm.gguf'
         : '',
   );
   final _promptCtrl = TextEditingController(

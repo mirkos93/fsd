@@ -19,9 +19,13 @@
 
 #ifdef __ANDROID__
 #  include <android/log.h>
+#  include <dlfcn.h>
 #  define FSD_LOG(...) __android_log_print(ANDROID_LOG_INFO, "fsd", __VA_ARGS__)
 #else
 #  include <cstdio>
+#  ifdef FSD_HAVE_VULKAN
+#    include <dlfcn.h>
+#  endif
 #  define FSD_LOG(...) do { fprintf(stderr, "[fsd] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 #endif
 
@@ -86,6 +90,88 @@ void png_write_to_vec(void* ctx, void* data, int size) {
 
 bool g_log_installed = false;
 
+// ---- Vulkan runtime probe -------------------------------------------------
+//
+// We *never* link libvulkan into libfsd.so. On Android the loader is provided
+// by the OS (api level 24+ ships /system/lib64/libvulkan.so), but plenty of
+// devices ship without a Vulkan ICD or have it disabled in driver config; we
+// don't want libfsd.so to fail to load on those.
+//
+// When SD_VULKAN was compiled in, ggml-vulkan handles its own loader
+// (Vulkan-Hpp dispatch). The probe below is just for fsd_gpu_available()
+// reporting.
+//
+// When SD_VULKAN is OFF, this always reports 0.
+
+int probe_vulkan_devices() {
+#ifdef FSD_HAVE_VULKAN
+    void* libvk = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!libvk) {
+        // Try the Khronos loader filename too (common on linux desktops).
+        libvk = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!libvk) {
+        FSD_LOG("vulkan: libvulkan not found via dlopen");
+        return 0;
+    }
+
+    using PFN_vkCreateInstance = int (*)(const void*, const void*, void**);
+    using PFN_vkDestroyInstance = void (*)(void*, const void*);
+    using PFN_vkEnumeratePhysicalDevices = int (*)(void*, uint32_t*, void*);
+
+    auto vkCreateInstance =
+        reinterpret_cast<PFN_vkCreateInstance>(dlsym(libvk, "vkCreateInstance"));
+    auto vkDestroyInstance =
+        reinterpret_cast<PFN_vkDestroyInstance>(dlsym(libvk, "vkDestroyInstance"));
+    auto vkEnumeratePhysicalDevices =
+        reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+            dlsym(libvk, "vkEnumeratePhysicalDevices"));
+    if (!vkCreateInstance || !vkDestroyInstance || !vkEnumeratePhysicalDevices) {
+        FSD_LOG("vulkan: missing required symbols in libvulkan");
+        dlclose(libvk);
+        return 0;
+    }
+
+    // VkInstanceCreateInfo: stype=1, sane defaults. We construct it as a raw
+    // byte buffer to avoid pulling in the heavy <vulkan/vulkan.h> header here
+    // — fsd.cpp doesn't depend on it.
+    struct {
+        int32_t  sType;
+        const void* pNext;
+        uint32_t flags;
+        const void* pAppInfo;
+        uint32_t enabledLayerCount;
+        const char* const* ppEnabledLayerNames;
+        uint32_t enabledExtensionCount;
+        const char* const* ppEnabledExtensionNames;
+    } createInfo = {};
+    // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
+    createInfo.sType = 1;
+
+    void* instance = nullptr;
+    int rc = vkCreateInstance(&createInfo, nullptr, &instance);
+    if (rc != 0 || !instance) {
+        FSD_LOG("vulkan: vkCreateInstance rc=%d", rc);
+        dlclose(libvk);
+        return 0;
+    }
+
+    uint32_t count = 0;
+    rc = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    vkDestroyInstance(instance, nullptr);
+    dlclose(libvk);
+
+    if (rc != 0) {
+        FSD_LOG("vulkan: vkEnumeratePhysicalDevices rc=%d", rc);
+        return 0;
+    }
+    FSD_LOG("vulkan: %u device(s) available", count);
+    return count > 0 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 }  // namespace
 
 extern "C" {
@@ -140,20 +226,24 @@ FSD_API const char* fsd_sd_commit(void) {
     return sd_commit();
 }
 
-FSD_API int fsd_generate(
+FSD_API int fsd_gpu_available(void) {
+    static int cached = -1;
+    if (cached < 0) cached = probe_vulkan_devices();
+    return cached;
+}
+
+// Internal: the actual generate path. Both fsd_generate and fsd_generate_v2
+// land here. With params->sampler == FSD_SAMPLER_DEFAULT and lora_path == NULL
+// this exactly replicates the legacy fsd_generate() path bit-for-bit.
+static int fsd_generate_inner(
     fsd_ctx* ctx,
-    const char* prompt,
-    const char* negative_prompt,
-    int width,
-    int height,
-    int steps,
-    int64_t seed,
+    const fsd_gen_params_t* params,
     fsd_step_cb cb,
     void* cb_user,
     uint8_t** png_out,
     size_t* png_len_out) {
 
-    if (!ctx || !ctx->sd || !prompt || !png_out || !png_len_out) return -1;
+    if (!ctx || !ctx->sd || !params || !params->prompt || !png_out || !png_len_out) return -1;
     *png_out = nullptr;
     *png_len_out = 0;
 
@@ -169,20 +259,43 @@ FSD_API int fsd_generate(
 
     sd_img_gen_params_t p;
     sd_img_gen_params_init(&p);
-    p.prompt          = prompt;
-    p.negative_prompt = negative_prompt ? negative_prompt : "";
-    p.width           = width;
-    p.height          = height;
-    p.seed            = seed;
+    p.prompt          = params->prompt;
+    p.negative_prompt = params->negative_prompt ? params->negative_prompt : "";
+    p.width           = params->width;
+    p.height          = params->height;
+    p.seed            = params->seed;
     p.batch_count     = 1;
     p.clip_skip       = -1;          // model default
+
+    // Steps: 0 sentinel -> the LCM canonical 4. Keep > 0 paths untouched so
+    // legacy callers (fsd_generate v1) still pass their own value through.
+    int steps = params->steps > 0 ? params->steps : 4;
     p.sample_params.sample_steps    = steps;
+
+    // Both DEFAULT and LCM map to the LCM sampler/scheduler today. Splitting
+    // them in the public API lets us flip DEFAULT to a quality regime later
+    // (DPM++ 2M + 20 steps) without breaking LCM callers, and gives the
+    // caller a clear handle for "I really want LCM" semantics on logs.
     p.sample_params.sample_method   = LCM_SAMPLE_METHOD;
     p.sample_params.scheduler       = LCM_SCHEDULER;
-    // LCM models are distilled to ignore CFG; 1.0 is the canonical value.
-    p.sample_params.guidance.txt_cfg            = 1.0f;
-    p.sample_params.guidance.img_cfg            = 1.0f;
+
+    // CFG: 0 sentinel -> 1.0 (LCM canonical, also bit-for-bit matches legacy).
+    float cfg = params->cfg_scale > 0.0f ? params->cfg_scale : 1.0f;
+    p.sample_params.guidance.txt_cfg            = cfg;
+    p.sample_params.guidance.img_cfg            = cfg;
     p.sample_params.guidance.distilled_guidance = 0.0f;
+
+    // LoRA: pass through as a single-element sd_lora_t array. With NULL
+    // lora_path we leave .loras = nullptr / .lora_count = 0 (sd_img_gen_params_init
+    // zeroes it), which is the bit-for-bit-no-LoRA path.
+    sd_lora_t lora_slot{};
+    if (params->lora_path && params->lora_path[0] != '\0') {
+        lora_slot.path        = params->lora_path;
+        lora_slot.multiplier  = params->lora_scale > 0.0f ? params->lora_scale : 1.0f;
+        lora_slot.is_high_noise = false;
+        p.loras     = &lora_slot;
+        p.lora_count = 1;
+    }
 
     sd_image_t* result = generate_image(ctx->sd, &p);
 
@@ -232,6 +345,44 @@ FSD_API int fsd_generate(
     *png_out     = heap;
     *png_len_out = png.size();
     return 0;
+}
+
+FSD_API int fsd_generate(
+    fsd_ctx* ctx,
+    const char* prompt,
+    const char* negative_prompt,
+    int width,
+    int height,
+    int steps,
+    int64_t seed,
+    fsd_step_cb cb,
+    void* cb_user,
+    uint8_t** png_out,
+    size_t* png_len_out) {
+
+    fsd_gen_params_t params{};
+    params.prompt          = prompt;
+    params.negative_prompt = negative_prompt;
+    params.width           = width;
+    params.height          = height;
+    params.steps           = steps;
+    params.seed            = seed;
+    params.sampler         = FSD_SAMPLER_DEFAULT;
+    params.cfg_scale       = 0.0f;   // sentinel -> 1.0 in inner
+    params.lora_path       = nullptr;
+    params.lora_scale      = 0.0f;
+    return fsd_generate_inner(ctx, &params, cb, cb_user, png_out, png_len_out);
+}
+
+FSD_API int fsd_generate_v2(
+    fsd_ctx* ctx,
+    const fsd_gen_params_t* params,
+    fsd_step_cb cb,
+    void* cb_user,
+    uint8_t** png_out,
+    size_t* png_len_out) {
+    if (!params) return -1;
+    return fsd_generate_inner(ctx, params, cb, cb_user, png_out, png_len_out);
 }
 
 FSD_API void fsd_free_bytes(uint8_t* p) {

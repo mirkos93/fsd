@@ -2,6 +2,10 @@
 ios/Frameworks/
 build/
 
+# Optional Vulkan-Hpp checkout, used only when SD_VULKAN=ON. ~400 MB; not
+# tracked. See src/CMakeLists.txt for the clone instructions.
+third_party/Vulkan-Hpp/
+
 # Miscellaneous
 *.class
 *.log
