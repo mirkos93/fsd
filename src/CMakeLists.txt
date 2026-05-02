@@ -10,11 +10,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---- stable-diffusion.cpp configuration ----
-# CPU-only for F2.1. Vulkan is on the F2.3 roadmap.
+# Backends always-off: never used in F2.x.
 set(SD_CUDA            OFF CACHE BOOL "" FORCE)
 set(SD_HIPBLAS         OFF CACHE BOOL "" FORCE)
-set(SD_METAL           OFF CACHE BOOL "" FORCE)
-set(SD_VULKAN          OFF CACHE BOOL "" FORCE)
 set(SD_OPENCL          OFF CACHE BOOL "" FORCE)
 set(SD_SYCL            OFF CACHE BOOL "" FORCE)
 set(SD_MUSA            OFF CACHE BOOL "" FORCE)
@@ -24,10 +22,21 @@ set(SD_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(SD_WEBP            OFF CACHE BOOL "" FORCE)
 set(SD_WEBM            OFF CACHE BOOL "" FORCE)
 
+# Backends that depend on the platform (Metal on iOS, Vulkan as F2.3 toggle):
+# leave SD_METAL / SD_VULKAN to whatever the caller passed via -D, defaulting
+# to OFF if not set. This lets tool/build_ios_xcframework.sh switch Metal on
+# without editing this file.
+if(NOT DEFINED SD_METAL)
+    set(SD_METAL OFF CACHE BOOL "" FORCE)
+endif()
+if(NOT DEFINED SD_VULKAN)
+    set(SD_VULKAN OFF CACHE BOOL "" FORCE)
+endif()
+
 # ggml settings
 set(GGML_LLAMAFILE     OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP        OFF CACHE BOOL "" FORCE)  # NDK toolchain doesn't bundle libomp by default
-set(GGML_NATIVE        OFF CACHE BOOL "" FORCE)  # don't auto-detect host arch (Android cross-compile)
+set(GGML_NATIVE        OFF CACHE BOOL "" FORCE)  # don't auto-detect host arch (mobile cross-compile)
 # K-quants stay ON: they're the default in upstream, do not touch.
 
 if (ANDROID)
@@ -53,9 +62,15 @@ add_subdirectory(
 )
 
 # ---- our shim ----
-add_library(fsd SHARED
-    fsd.cpp
-)
+# Android: shared lib loaded via DynamicLibrary.open('libfsd.so').
+# iOS:     static lib merged into the xcframework, then linked into Runner.app
+#          (consumer Dart uses DynamicLibrary.process()). Selected via the
+#          FSD_IOS_STATIC flag set by tool/build_ios_xcframework.sh.
+if(IOS OR FSD_IOS_STATIC)
+    add_library(fsd STATIC fsd.cpp)
+else()
+    add_library(fsd SHARED fsd.cpp)
+endif()
 
 set_target_properties(fsd PROPERTIES
     OUTPUT_NAME "fsd"
@@ -76,4 +91,11 @@ if (ANDROID)
     # Android 15 16k page size + log lib
     target_link_options(fsd PRIVATE "-Wl,-z,max-page-size=16384")
     target_link_libraries(fsd PRIVATE log)
+endif()
+
+if (APPLE)
+    # Metal / MetalKit / Foundation / Accelerate are pulled in transitively
+    # by the sd.cpp + ggml targets when SD_METAL=ON. We just need to make
+    # sure the static archive includes everything under -ObjC paths.
+    target_link_options(fsd PRIVATE "-Wl,-force_load,$<TARGET_FILE:stable-diffusion>")
 endif()

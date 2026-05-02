@@ -1,3 +1,7 @@
+# fsd build outputs
+ios/Frameworks/
+build/
+
 # Miscellaneous
 *.class
 *.log

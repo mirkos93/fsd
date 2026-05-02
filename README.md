@@ -15,7 +15,7 @@ nothing here is Tacita-specific.
 | Android arm64-v8a (CPU) | ✅ shipped |
 | Android armeabi-v7a | ❌ not viable (see *Why no v7a* below) |
 | Android x86_64 | ❌ skipped |
-| iOS | ⏳ scaffolded but unbuilt — separate session on a Mac |
+| iOS (Metal) | ⏳ build pipeline drafted (see *iOS build* below), untested — needs a Mac |
 | Vulkan / GPU backends | ⏳ F2.3 |
 
 ## Pinned upstream
@@ -75,6 +75,57 @@ adb push sd_v1.5_lcm.gguf \
 
 # 3) Open the app, tap Load, then Generate.
 ```
+
+## Build (iOS)
+
+The iOS pipeline is **two-step on purpose**: there is a Mac-only build
+step that produces a vendored xcframework, and a normal `pod install`
+that consumes it. This keeps the per-app `pod install` fast and lets
+`pod lib lint` succeed with no exotic CMake-on-CocoaPods plumbing.
+
+**Step 1 (Mac, Xcode 15+, CMake ≥ 3.22 from Homebrew):**
+
+```bash
+./tool/build_ios_xcframework.sh
+# → ios/Frameworks/fsd.xcframework  (gitignored)
+```
+
+The script:
+- configures CMake against the iOS toolchain twice (device arm64,
+  simulator arm64+x86_64),
+- builds with `SD_METAL=ON` + `GGML_METAL_EMBED_LIBRARY=ON` so Metal
+  shaders are linked into the static archive,
+- merges all transitive `.a` archives via `libtool -static`,
+- packages the slices with `xcodebuild -create-xcframework`.
+
+**Step 2 (any machine that consumes the plugin):**
+
+`pod install` in the consumer app picks up `vendored_frameworks` from
+`ios/fsd.podspec`. If the xcframework is missing the podspec aborts
+with a clear "run the script first" message instead of silently
+linking a hollow pod.
+
+### Why this layout (and not "build everything in podspec")
+
+- Apple's `pod install` invokes Xcode, not CMake. Trying to drive
+  sd.cpp+ggml's CMake from inside a `prepare_command` works but
+  makes pod install take ~5 min and re-runs on every clean checkout.
+- A vendored xcframework is what fllama-style production plugins
+  ship with. CI can produce it once per release; consumers never
+  rebuild it.
+
+### Can I do step 1 on CircleCI without owning a Mac?
+
+Yes. CircleCI's macOS executor runs Xcode and Homebrew, so
+`./tool/build_ios_xcframework.sh` runs unmodified. Wire it into a job
+that uploads `ios/Frameworks/fsd.xcframework` as a workflow artifact
+(or attaches it to a GitHub release); Tacita's normal `pod install`
+then downloads it. **Status:** the script is drafted but has never
+been executed — first attempt on a Mac will likely surface 1–2
+toolchain quirks to fix (Metal shader path, libtool merge order,
+maybe `-fembed-bitcode` settings depending on the Xcode version).
+Treat F2.4 as "wire CircleCI + iterate on this script", not "ship
+done".
 
 ## Why no armeabi-v7a (32-bit ARM)
 
@@ -158,4 +209,6 @@ and paste them above.
   provider, behind a feature flag.
 - F2.3 — Vulkan backend (`-DSD_VULKAN=ON`), gated on Adreno 6xx+ /
   Mali-G68+ to avoid driver lottery on older GPUs.
-- F2.4 — iOS build (Metal backend), separate session on a Mac.
+- F2.4 — iOS build (Metal backend). Pipeline drafted in
+  `tool/build_ios_xcframework.sh` + `ios/fsd.podspec`; needs first
+  successful run on a Mac (or CircleCI macOS executor).

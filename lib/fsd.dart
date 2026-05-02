@@ -72,7 +72,9 @@ final DynamicLibrary _dylib = () {
     return DynamicLibrary.open('lib$_libName.so');
   }
   if (Platform.isIOS || Platform.isMacOS) {
-    return DynamicLibrary.open('$_libName.framework/$_libName');
+    // iOS xcframework is a static lib merged into Runner.app; symbols are
+    // already in the process namespace, so process() resolves them.
+    return DynamicLibrary.process();
   }
   if (Platform.isWindows) {
     return DynamicLibrary.open('$_libName.dll');
