@@ -56,6 +56,9 @@ class ImageGenRequest {
     this.cfgScale,
     this.loraPath,
     this.loraScale,
+    this.vaeTilingEnabled = false,
+    this.vaeTileSize = 0,
+    this.vaeTileOverlap = 0.0,
   });
 
   final String prompt;
@@ -85,6 +88,22 @@ class ImageGenRequest {
   /// effectively 0..1 for LCM LoRAs; higher values amplify both the speed
   /// boost and the "plasticky" look LCM is known for.
   final double? loraScale;
+
+  /// FSD-PATCH: VAE tiling. When true, the VAE decode pass slices the
+  /// latent into overlapping tiles to bound peak RAM during the final
+  /// stage. Useful on RAM-tight devices (≤6 GB) at resolutions ≥ 512.
+  /// No effect on the denoising loop itself; default off.
+  final bool vaeTilingEnabled;
+
+  /// FSD-PATCH: tile edge size in pixels of the latent (default 256).
+  /// Lower values = lower peak RAM, slightly more decode overhead.
+  /// Only consulted when [vaeTilingEnabled] is true.
+  final int vaeTileSize;
+
+  /// FSD-PATCH: tile overlap fraction (0..1; default 0.25). Higher
+  /// reduces seam artifacts at the cost of compute. Only consulted
+  /// when [vaeTilingEnabled] is true.
+  final double vaeTileOverlap;
 }
 
 sealed class ImageGenProgress {}
@@ -165,6 +184,13 @@ final class _FsdGenParams extends Struct {
   external Pointer<Utf8> loraPath;
   @Float()
   external double loraScale;
+  // FSD-PATCH: VAE tiling fields. Order MUST match fsd_gen_params_t.
+  @Int32()
+  external int vaeTilingEnabled;
+  @Int32()
+  external int vaeTileSize;
+  @Float()
+  external double vaeTileOverlap;
 }
 
 typedef _FsdGenerateV2Native = Int32 Function(
@@ -461,6 +487,9 @@ void _runGenerate(Pointer<Void> ctx, _GenerateRequest msg) {
     p.cfgScale        = msg.req.cfgScale ?? 0.0; // 0 -> native default (1.0)
     p.loraPath        = loraPtr.cast<Utf8>();
     p.loraScale       = msg.req.loraScale ?? 0.0; // 0 -> native default (1.0)
+    p.vaeTilingEnabled = msg.req.vaeTilingEnabled ? 1 : 0;
+    p.vaeTileSize      = msg.req.vaeTileSize;
+    p.vaeTileOverlap   = msg.req.vaeTileOverlap;
 
     final rc = _fsdGenerateV2(
       ctx,

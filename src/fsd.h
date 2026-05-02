@@ -25,15 +25,15 @@ typedef int (*fsd_step_cb)(int step, int total, void* user);
 // fine-grained choice (Euler vs. Heun vs. DPM++) is the engine's job; the
 // caller only decides between the two regimes this plugin exposes.
 //
-//   FSD_SAMPLER_DEFAULT — LCM sampler + LCM scheduler + cfg=1.0. Matches the
-//                         original fsd_generate behaviour and is bit-for-bit
-//                         identical to that signature when the same
-//                         seed/steps/W/H are supplied.
-//   FSD_SAMPLER_LCM     — Same as DEFAULT today (kept distinct so future
-//                         non-LCM defaults don't break LCM callers). Layered
-//                         on top: when an LCM LoRA is supplied via lora_path
-//                         the caller is expected to pass steps=4 and
-//                         cfg_scale=1.0; we don't override.
+//   FSD_SAMPLER_DEFAULT — Quality regime: Euler-A sampler + Karras scheduler.
+//                         For SD 1.5 base checkpoints without an LCM LoRA;
+//                         caller should pass steps>=20 and cfg_scale~7.0.
+//                         FSD-PATCH: prior versions of this enum mapped
+//                         DEFAULT to LCM hardcoded; the C side now honors
+//                         the enum value.
+//   FSD_SAMPLER_LCM     — LCM sampler + LCM scheduler + cfg=1.0. Layered with
+//                         an LCM LoRA via lora_path, this is the "4 step"
+//                         regime: caller should pass steps=4.
 typedef enum {
     FSD_SAMPLER_DEFAULT = 0,
     FSD_SAMPLER_LCM     = 1,
@@ -45,6 +45,9 @@ typedef enum {
 //   - sampler == FSD_SAMPLER_DEFAULT
 //   - cfg_scale == 0             -> treated as 1.0 (LCM canonical)
 //   - steps  == 0                -> treated as 4 (LCM canonical for SD 1.5)
+//   - vae_tiling_enabled == 0    -> disabled (default, matches sd.cpp)
+//   - vae_tile_size == 0         -> 256 when tiling is enabled
+//   - vae_tile_overlap == 0      -> 0.25 when tiling is enabled
 typedef struct {
     const char*   prompt;
     const char*   negative_prompt;
@@ -56,6 +59,13 @@ typedef struct {
     float         cfg_scale;
     const char*   lora_path;     // optional, may be NULL
     float         lora_scale;    // 0 -> 1.0 default
+    // FSD-PATCH: VAE tiling. Decode the VAE in tiles to bound peak RAM
+    // during the final stage; useful on RAM-tight phones (<= 6 GB) and at
+    // resolutions >= 512. Has no effect on the denoising loop itself.
+    // Set vae_tiling_enabled = 1 to opt in.
+    int           vae_tiling_enabled;
+    int           vae_tile_size;       // 0 -> 256 (sd.cpp recommended)
+    float         vae_tile_overlap;    // 0 -> 0.25
 } fsd_gen_params_t;
 
 // Loads a stable-diffusion checkpoint. Returns NULL on failure.

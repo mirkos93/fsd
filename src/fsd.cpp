@@ -199,7 +199,12 @@ FSD_API fsd_ctx* fsd_load(const char* model_path) {
     p.keep_control_net_on_cpu = false;
     p.keep_vae_on_cpu        = false;
     p.flash_attn             = false;
-    p.diffusion_flash_attn   = false;
+    // FSD-PATCH: enable flash-attention for the diffusion U-Net.
+    // +20-35% sampling throughput on Tensor G3 / Snapdragon 8 Gen 2 per
+    // public sd.cpp benchmarks; small constant cost on cold load.
+    // The text-encoder / VAE flash_attn path stays off pending separate
+    // benching — those passes are short relative to the U-Net loop.
+    p.diffusion_flash_attn   = true;
 
     sd_ctx_t* sd = new_sd_ctx(&p);
     if (!sd) {
@@ -272,12 +277,24 @@ static int fsd_generate_inner(
     int steps = params->steps > 0 ? params->steps : 4;
     p.sample_params.sample_steps    = steps;
 
-    // Both DEFAULT and LCM map to the LCM sampler/scheduler today. Splitting
-    // them in the public API lets us flip DEFAULT to a quality regime later
-    // (DPM++ 2M + 20 steps) without breaking LCM callers, and gives the
-    // caller a clear handle for "I really want LCM" semantics on logs.
-    p.sample_params.sample_method   = LCM_SAMPLE_METHOD;
-    p.sample_params.scheduler       = LCM_SCHEDULER;
+    // FSD-PATCH: honor params->sampler. Prior to this, both enum values
+    // mapped to the LCM hardcode regardless of caller intent — which made
+    // a 20-step DEFAULT request waste 16 steps relative to LCM's 4-step
+    // sweet spot AND produced washed-out outputs when no LCM LoRA was
+    // attached. DEFAULT is the quality regime (Euler-A + Karras), LCM
+    // stays on the LCM sampler+scheduler. Caller is responsible for
+    // pairing LCM with steps=4 + an LCM LoRA + cfg=1.0.
+    switch (params->sampler) {
+    case FSD_SAMPLER_LCM:
+        p.sample_params.sample_method = LCM_SAMPLE_METHOD;
+        p.sample_params.scheduler     = LCM_SCHEDULER;
+        break;
+    case FSD_SAMPLER_DEFAULT:
+    default:
+        p.sample_params.sample_method = EULER_A_SAMPLE_METHOD;
+        p.sample_params.scheduler     = KARRAS_SCHEDULER;
+        break;
+    }
 
     // CFG: 0 sentinel -> 1.0 (LCM canonical, also bit-for-bit matches legacy).
     float cfg = params->cfg_scale > 0.0f ? params->cfg_scale : 1.0f;
@@ -295,6 +312,18 @@ static int fsd_generate_inner(
         lora_slot.is_high_noise = false;
         p.loras     = &lora_slot;
         p.lora_count = 1;
+    }
+
+    // FSD-PATCH: VAE tiling. When enabled, the VAE decode pass slices
+    // the latent into overlapping tiles to bound peak RAM. Optional —
+    // off by default. Caller decides per-request based on device RAM.
+    if (params->vae_tiling_enabled != 0) {
+        p.vae_tiling_params.enabled        = true;
+        int tile = params->vae_tile_size > 0 ? params->vae_tile_size : 256;
+        p.vae_tiling_params.tile_size_x    = tile;
+        p.vae_tiling_params.tile_size_y    = tile;
+        p.vae_tiling_params.target_overlap =
+            params->vae_tile_overlap > 0.0f ? params->vae_tile_overlap : 0.25f;
     }
 
     sd_image_t* result = generate_image(ctx->sd, &p);
